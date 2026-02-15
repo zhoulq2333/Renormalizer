@@ -877,9 +877,7 @@ class TTNS(TTNBase):
         - A sum of operators (:class:`~renormalizer.model.OpSum`)
 
         .. math::
-            \langle \psi | \hat{O} | \psi \rangle
-
-        where :math:`|\psi\rangle` is the current TTNS (ket). The `bra` vector is currently not supported.
+            \langle bra | \hat{O} | ket \rangle
 
         Parameters
         ----------
@@ -887,7 +885,7 @@ class TTNS(TTNBase):
             The operator to compute the expectation value of. If an `Op` or `OpSum` is provided,
             it is automatically converted to a TTNO using the basis tree of the current TTNS.
         bra : :class:`~renormalizer.tn.TTNS`, optional
-            The bra vector (currently not implemented). Defaults to None.
+            The bra vector. Defaults to None.
 
         Returns
         -------
@@ -897,22 +895,28 @@ class TTNS(TTNBase):
         Examples
         --------
         >>> from renormalizer import Op, BasisHalfSpin
-        >>> from renormalizer.tn import TTNS, BasisTree
+        >>> from renormalizer.tn import TTNS, BasisTree, TTNO
 
         # Build a TTNS and operator
         >>> basis_tree = BasisTree.binary([BasisHalfSpin(0), BasisHalfSpin(1)])
         >>> ttns = TTNS(basis_tree)
         >>> op = Op("sigma_z", 0)
+        >>> ttno = TTNO(basis_tree, op)
 
         # Compute expectation value
-        >>> ttns.expectation(op)
+        >>> ttns.expectation(ttno)
+        1.0
+
+        # Compute \langle bra | \hat{O} | ket \rangle
+        >>> bra = ttns.copy()
+        >>> ket = ttno @ ttns
+        >>> ket.expectation(ttno, bra=bra)
         1.0
         """
         # Convert Op/OpSum to MPO if needed
         if isinstance(ttno, (Op, OpSum)):
             ttno = TTNO(self.basis, ttno)
 
-        assert bra is None  # not implemented yet
         basis_node = TreeNodeBasis([BasisDummy("expectation dummy")])
         basis_node_ttns = basis_node
         basis_node_ttno = basis_node.copy()
@@ -927,12 +931,24 @@ class TTNS(TTNBase):
 
         ttns_extended = TTNS(basis_tree_ttns, root=snode)
         ttno_extended = TTNO(basis_tree_ttno, [], root=onode)
-        environ = TTNEnviron(ttns_extended, ttno_extended, build_environ=False)
-        environ.build_children_environ(ttns_extended, ttno_extended)
+        if bra is not None:
+            if bra is self:
+                bra = self.copy()
+            snode_bra = TreeNodeTensor(np.ones((1, 1, 1)), qn=np.zeros((1, basis_tree_ttns.qn_size)))
+            snode_bra.add_child(bra.root)
+            bra_extended = TTNS(basis_tree_ttns, root=snode_bra)
+            environ = TTNEnviron(ttns_extended, ttno_extended, bra_extended, build_environ=False)
+            environ.build_children_environ(ttns_extended, ttno_extended, ttns_bra=bra_extended)
+        else:
+            environ = TTNEnviron(ttns_extended, ttno_extended, build_environ=False)
+            environ.build_children_environ(ttns_extended, ttno_extended)
         val = environ.root.environ_children[0].ravel()[0]
 
         for node in [self.basis.root, self.root, ttno.root]:
             node.parent = None
+
+        if bra is not None:
+            bra.root.parent = None
 
         if np.isclose(float(val.imag), 0):
             return float(val.real)
@@ -1578,7 +1594,7 @@ class TTNEnviron(Tree):
     """
     A tree whose tree node is ``TreeNodeEnviron``.
     """
-    def __init__(self, ttns: TTNS, ttno: TTNO, build_environ=True):
+    def __init__(self, ttns: TTNS, ttno: TTNO, ttns_bra: TTNS = None, build_environ=True):
         self.basis_ttns = ttns.basis
         self.basis_ttno = ttno.basis
         enodes: List[TreeNodeEnviron] = [TreeNodeEnviron() for _ in range(ttns.size)]
@@ -1593,53 +1609,58 @@ class TTNEnviron(Tree):
             self.build_children_environ(ttns, ttno)
             self.build_parent_environ(ttns, ttno)
 
-    def build_children_environ(self, ttns, ttno):
+    def build_children_environ(self, ttns, ttno, ttns_bra=None):
         # first run, children environment to the parent.
         # set enode.environ_children
         snodes: List[TreeNodeTensor] = ttns.postorder_list()
         for snode in snodes:
-            self.build_children_environ_node(snode, ttns, ttno)
+            self.build_children_environ_node(snode, ttns, ttno, ttns_bra)
 
-    def build_parent_environ(self, ttns, ttno):
+    def build_parent_environ(self, ttns, ttno, ttns_bra=None):
         # second run, parent environment to children
         # set enode.environ_parent
         snodes: List[TreeNodeTensor] = ttns.node_list
         for snode in snodes:
             for ichild in range(len(snode.children)):
-                self.build_parent_environ_node(snode, ichild, ttns, ttno)
+                self.build_parent_environ_node(snode, ichild, ttns, ttno, ttns_bra)
 
-    def update_1bond(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO):
+    def update_1bond(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttns_bra: TTNS = None):
         # update environ for the bond between snode and snode.parent
-        self.build_children_environ_node(snode, ttns, ttno)
-        self.build_parent_environ_node(snode.parent, snode.idx_as_child, ttns, ttno)
+        self.build_children_environ_node(snode, ttns, ttno, ttns_bra)
+        self.build_parent_environ_node(snode.parent, snode.idx_as_child, ttns, ttno, ttns_bra)
 
-    def update_1site(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO):
+    def update_1site(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttns_bra: TTNS = None):
         # update environ based on snode
-        self.build_children_environ_node(snode, ttns, ttno)
+        self.build_children_environ_node(snode, ttns, ttno, ttns_bra)
         for ichild in range(len(snode.children)):
-            self.build_parent_environ_node(snode, ichild, ttns, ttno)
+            self.build_parent_environ_node(snode, ichild, ttns, ttno, ttns_bra)
 
-    def update_2site(self, snode, ttns, ttno):
+    def update_2site(self, snode, ttns, ttno, ttns_bra: TTNS = None):
         # update environ based on snode and its parent
-        self.build_children_environ_node(snode, ttns, ttno)
-        self.build_children_environ_node(snode.parent, ttns, ttno)
+        self.build_children_environ_node(snode, ttns, ttno, ttns_bra)
+        self.build_children_environ_node(snode.parent, ttns, ttno, ttns_bra)
         for ichild in range(len(snode.parent.children)):
-            self.build_parent_environ_node(snode.parent, ichild, ttns, ttno)
+            self.build_parent_environ_node(snode.parent, ichild, ttns, ttno, ttns_bra)
         for ichild in range(len(snode.children)):
-            self.build_parent_environ_node(snode, ichild, ttns, ttno)
+            self.build_parent_environ_node(snode, ichild, ttns, ttno, ttns_bra)
 
-    def build_children_environ_node(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO):
+    def build_children_environ_node(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttns_bra: TTNS = None):
         # build the environment from snode to its parent and store the environment in its parent
         if snode.parent is None:
             return
         enode = self.node_list[ttns.node_idx[snode]]
         onode = ttno.node_list[ttns.node_idx[snode]]
+        if ttns_bra is None:
+            bra_tensor = snode.tensor.conj()
+        else:
+            bra_tensor = ttns_bra.node_list[ttns.node_idx[snode]].tensor.conj()
+
         args = []
         for i, child_tensor in enumerate(enode.environ_children):
             indices = self.get_child_indices(enode, i, ttns, ttno)
             args.extend([child_tensor, indices])
 
-        args.append(snode.tensor.conj())
+        args.append(bra_tensor)
         args.append(ttns.get_node_indices(snode, conj=True))
 
         args.append(onode.tensor)
@@ -1660,10 +1681,15 @@ class TTNEnviron(Tree):
             ichild = snode.parent.children.index(snode)
             enode.parent.environ_children[ichild] = asnumpy(res)
 
-    def build_parent_environ_node(self, snode: TreeNodeTensor, ichild: int, ttns: TTNS, ttno: TTNO):
+    def build_parent_environ_node(self, snode: TreeNodeTensor, ichild: int, ttns: TTNS, ttno: TTNO, ttns_bra: TTNS = None):
         # build the environment from snode to the ith child of snode and store the environment in the child
         enode = self.node_list[ttns.node_idx[snode]]
         onode = ttno.node_list[ttns.node_idx[snode]]
+        if ttns_bra is None:
+            bra_tensor = snode.tensor.conj()
+        else:
+            bra_tensor = ttns_bra.node_list[ttns.node_idx[snode]].tensor.conj()
+
         args = []
         # children tensor
         for j, child_tensor in enumerate(enode.environ_children):
@@ -1676,7 +1702,7 @@ class TTNEnviron(Tree):
         indices = self.get_parent_indices(enode, ttns, ttno)
         args.extend([enode.environ_parent, indices])
 
-        args.append(snode.tensor.conj())
+        args.append(bra_tensor)
         args.append(ttns.get_node_indices(snode, conj=True))
 
         args.append(onode.tensor)
