@@ -290,3 +290,28 @@ def test_print(basis):
     ttns = TTNS.random(basis, 0, 5, 1)
     ttns.print_shape()
     ttns.print_vn_entropy()
+
+@pytest.mark.parametrize("basis_tree", [basis_binary, basis_multi_basis])
+def test_expectation_with_bra(basis_tree):
+    ops = heisenberg_ops(nspin)
+    ttns = TTNS.random(basis_tree, qntot=0, m_max=4)
+    ttno = TTNO(basis_tree, ops)
+    # test <psi|O|psi>
+    e1 = ttns.expectation(ttno)
+    e2 = ttns.expectation(ttno, bra=ttns)
+    assert np.isclose(e1, e2)
+    # test <bra|O|ket> with bra != ket
+    sigma_x_op = [Op("sigma_x", [i], factor=1.0) for i in range(nspin)]
+    sigma_z_op = [Op("sigma_z", [i], factor=1.0) for i in range(nspin)]
+    sigma_zx_op = []
+    for i in range(nspin):
+        for j in range(nspin):
+            sigma_zx_op.append(Op("sigma_z sigma_x", [i, j], factor=1.0))
+    sigma_x_ttno = TTNO(basis_tree, sigma_x_op)
+    sigma_z_ttno = TTNO(basis_tree, sigma_z_op)
+    sigma_zx_ttno = TTNO(basis_tree, sigma_zx_op)
+    bra = ttns.copy()
+    ket = sigma_x_ttno @ ttns
+    val1 = bra.expectation(sigma_z_ttno, ket)
+    val2 = bra.expectation(sigma_zx_ttno)
+    assert np.isclose(val1, val2)
